@@ -110,17 +110,16 @@ class FileSharePeer:
 
     def command_loop(self):
         while self.running:
-            cmd = input("Enter command (list/connect/exit/upload/myfies): ").strip().lower()
-            if cmd == "list":
-                if not self.peers:
-                    print("No peers discovered yet.")
-                else:
-                    for i, peer in enumerate(self.peers):
-                        print(f"{i+1}: {peer[0]}:{peer[1]}")
-            elif cmd == "connect":
+            cmd = input("Enter command (connect/exit/upload/myfies): ").strip().lower()
+
+            if cmd == "connect":
                 if not self.peers:
                     print("No peers to connect to.")
                     continue
+                else:
+                    for i, peer in enumerate(self.peers):
+                        print(f"{i+1}: {peer[0]}:{peer[1]}")
+
                 index = int(input("Enter peer number to connect: ")) - 1
                 if 0 <= index < len(self.peers):
                     ip, port = list(self.peers)[index]
