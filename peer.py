@@ -7,13 +7,20 @@ import os
 import uuid
 import shutil
 import json
+from auth import *
 
 class FileSharePeer:
     def __init__(self, listen_port=5000):
+        # for login
+        self.logged_in_user = None
+
+        # for connection with other peers
         self.listen_port = listen_port
         self.local_ip = discovery.get_local_ip()
         self.peers = set()  # Discovered peers (IP, port)
         self.running = True
+
+        # for file sharing
         os.makedirs("shared", exist_ok=True)
         os.makedirs("received", exist_ok=True)
         self.shared_files = {}  # Initialize file tracking
@@ -77,8 +84,12 @@ class FileSharePeer:
             client.send(b"LIST_FILES")
 
             data = client.recv(8192).decode()
-            import json
-            files = json.loads(data).get("files", [])
+
+            response = json.loads(data)
+            files = response.get("files", [])
+            owner_username = response.get("username", "unknown")
+
+            print(f"\n[+] Connected to peer: {ip}:{port} ({owner_username})")
 
             if not files:
                 print("[*] No files available from peer.")
@@ -106,30 +117,23 @@ class FileSharePeer:
         except Exception as e:
             print(f"[!] Could not connect to {ip}:{port} - {e}")
 
-
-
-    def command_loop(self):
+    def authenticated_loop(self):
         while self.running:
-            cmd = input("Enter command (connect/exit/upload/myfies): ").strip().lower()
+            cmd = input("Enter command (connect/upload/myfiles/logout/exit): ").strip().lower()
 
             if cmd == "connect":
                 if not self.peers:
-                    print("No peers to connect to.")
+                    print("No peers discovered yet.")
                     continue
-                else:
-                    for i, peer in enumerate(self.peers):
-                        print(f"{i+1}: {peer[0]}:{peer[1]}")
-
+                for i, peer in enumerate(self.peers):
+                    print(f"{i + 1}: {peer[0]}:{peer[1]}")
                 index = int(input("Enter peer number to connect: ")) - 1
                 if 0 <= index < len(self.peers):
                     ip, port = list(self.peers)[index]
                     self.connect_to_peer(ip, port)
                 else:
                     print("Invalid index.")
-            elif cmd == "exit":
-                print("[*] Shutting down...")
-                self.running = False
-                break
+
             elif cmd == "upload":
                 path = input("Enter full path to the file: ").strip()
                 self.upload_file(path)
@@ -137,10 +141,54 @@ class FileSharePeer:
             elif cmd == "myfiles":
                 self.list_shared_files()
 
+            elif cmd == "logout":
+                print(f"[*] User {self.logged_in_user} logged out.")
+                self.logged_in_user = None
+                self.command_loop()  # Go back to unauthenticated mode
+                break
+
+            elif cmd == "exit":
+                print("[*] Shutting down...")
+                self.running = False
+                break
+
             else:
                 print("Unknown command.")
 
+    def command_loop(self):
+        while self.running and not self.logged_in_user:
+            cmd = input("Enter command (register/login/exit): ").strip().lower()
+
+            if cmd == "register":
+                register_user()
+
+            elif cmd == "login":
+                username = login_user()
+                if username:
+                    self.logged_in_user = username
+
+            elif cmd == "exit":
+                print("[*] Shutting down...")
+                self.running = False
+                break
+
+            else:
+                print("Unknown command.")
+
+        # ➡️ This is where authenticated_loop() is called!
+        if self.logged_in_user:
+            print(f"[✓] Welcome, {self.logged_in_user}! You're now logged in.")
+            self.authenticated_loop()
+
+
+
     def upload_file(self, filepath):
+
+        if not self.logged_in_user:
+            print("[!] You must be logged in to upload files.")
+            return
+
+
         if not os.path.isfile(filepath):
             print("[!] File does not exist.")
             return
@@ -167,10 +215,16 @@ class FileSharePeer:
             print(f"{i}. {info['filename']} (ID: {fid}, Size: {info['size']} bytes)")
 
     def download_file(self, file_id, ip, port):
+
+        if not self.logged_in_user:
+            print("[!] You must be logged in to download files.")
+            return
+
+
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((ip, port))
-            sock.send(f"GET_FILE:{file_id}".encode())
+            sock.send(f"GET_FILE:{file_id}|{self.logged_in_user}".encode())
 
             dest_path = os.path.join("received", f"{file_id}.bin")
             with open(dest_path, "wb") as f:
@@ -190,15 +244,24 @@ class FileSharePeer:
         try:
             data = conn.recv(1024).decode()
             if data.startswith("GET_FILE:"):
-                file_id = data.split(":")[1]
+
+                file_info = data.split(":")[1]
+                if "|" in file_info:
+                    file_id, requesting_user = file_info.split("|")
+                else:
+                    file_id, requesting_user = file_info, "unknown"
+
+
                 if file_id in self.shared_files:
                     file_path = self.shared_files[file_id]["path"]
                     with open(file_path, "rb") as f:
                         while chunk := f.read(1024):
                             conn.sendall(chunk)
-                    print(f"[UPLOAD] Sent file {file_id} to {addr}")
+                    print(f"[UPLOAD] Sent file {file_id} to {addr} (user: {requesting_user})")
+
                 else:
                     conn.send(b"ERROR: File not found.")
+
 
             elif data == "LIST_FILES":
                 file_list = []
@@ -208,8 +271,13 @@ class FileSharePeer:
                         "name": meta["filename"],
                         "size": meta["size"]
                     })
-                response = json.dumps({"files": file_list})
-                conn.sendall(response.encode())
+
+                # Include username of this peer (if logged in)
+                response = {
+                    "files": file_list,
+                    "username": self.logged_in_user or "unknown"
+                }
+                conn.sendall(json.dumps(response).encode())
             else:
                 print(f"[{addr}] {data}")  # Basic text message fallback
         except Exception as e:
