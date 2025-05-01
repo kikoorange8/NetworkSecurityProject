@@ -9,6 +9,10 @@ import shutil
 import json
 from auth import *
 
+# For Phase 3 File Encryption, Decryption, File Integrity, Key Management
+from crypto_utils import encrypt_file, decrypt_file, hash_file
+
+
 class FileSharePeer:
     def __init__(self, listen_port=5000):
         # for login
@@ -180,14 +184,10 @@ class FileSharePeer:
             print(f"[✓] Welcome, {self.logged_in_user}! You're now logged in.")
             self.authenticated_loop()
 
-
-
     def upload_file(self, filepath):
-
         if not self.logged_in_user:
             print("[!] You must be logged in to upload files.")
             return
-
 
         if not os.path.isfile(filepath):
             print("[!] File does not exist.")
@@ -195,17 +195,32 @@ class FileSharePeer:
 
         filename = os.path.basename(filepath)
         file_id = str(uuid.uuid4())
-        shared_path = os.path.join("shared", filename)
 
-        shutil.copy(filepath, shared_path)
+        # Encrypt the file
+        enc_path, key, iv, sha256_hash = encrypt_file(filepath)
 
+        # Move encrypted file into shared/
+        final_shared_path = os.path.join("shared", f"{file_id}.enc")
+        shutil.move(enc_path, final_shared_path)
+
+        # Track encrypted file and metadata
         self.shared_files[file_id] = {
             "filename": filename,
-            "path": shared_path,
-            "size": os.path.getsize(shared_path)
+            "path": final_shared_path,
+            "size": os.path.getsize(final_shared_path)
         }
 
-        print(f"[+] File '{filename}' is now shared with ID: {file_id}")
+        if not hasattr(self, "encryption_keys"):
+            self.encryption_keys = {}
+
+        self.encryption_keys[file_id] = {
+            "key": key,
+            "iv": iv,
+            "hash": sha256_hash,
+            "original_name": filename
+        }
+
+        print(f"[+] File '{filename}' encrypted and shared with ID: {file_id}")
 
     def list_shared_files(self):
         if not self.shared_files:
@@ -215,26 +230,48 @@ class FileSharePeer:
             print(f"{i}. {info['filename']} (ID: {fid}, Size: {info['size']} bytes)")
 
     def download_file(self, file_id, ip, port):
-
         if not self.logged_in_user:
             print("[!] You must be logged in to download files.")
             return
-
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((ip, port))
             sock.send(f"GET_FILE:{file_id}|{self.logged_in_user}".encode())
 
-            dest_path = os.path.join("received", f"{file_id}.bin")
-            with open(dest_path, "wb") as f:
+            # 🔹 Step 1: Receive metadata first (key, iv, hash, original filename)
+            buffer = b""
+            while not buffer.endswith(b"\n"):
+                chunk = sock.recv(1)
+                if not chunk:
+                    raise Exception("Connection closed before metadata received")
+                buffer += chunk
+
+            metadata = json.loads(buffer.decode())
+            key = bytes.fromhex(metadata["key"])
+            iv = bytes.fromhex(metadata["iv"])
+            expected_hash = metadata["hash"]
+            original_filename = metadata["filename"]
+
+            # 🔹 Step 2: Receive the encrypted file
+            enc_path = os.path.join("received", f"{file_id}.enc")
+            with open(enc_path, "wb") as f:
                 while True:
-                    chunk = sock.recv(1024)
+                    chunk = sock.recv(4096)
                     if not chunk:
                         break
                     f.write(chunk)
 
-            print(f"[+] File downloaded and saved to {dest_path}")
+            # 🔹 Step 3: Decrypt the file
+            decrypted_path = os.path.join("received", original_filename)
+            decrypt_file(enc_path, key, iv, decrypted_path)
+
+            # 🔹 Step 4: Verify integrity
+            if hash_file(decrypted_path) == expected_hash:
+                print(f"[✓] File downloaded, decrypted, and verified: {decrypted_path}")
+            else:
+                print("[!] Warning: File integrity check FAILED.")
+
         except Exception as e:
             print(f"[!] Download failed: {e}")
         finally:
@@ -243,25 +280,43 @@ class FileSharePeer:
     def handle_client(self, conn, addr):
         try:
             data = conn.recv(1024).decode()
-            if data.startswith("GET_FILE:"):
 
+            if data.startswith("GET_FILE:"):
                 file_info = data.split(":")[1]
                 if "|" in file_info:
                     file_id, requesting_user = file_info.split("|")
                 else:
                     file_id, requesting_user = file_info, "unknown"
 
-
-                if file_id in self.shared_files:
-                    file_path = self.shared_files[file_id]["path"]
-                    with open(file_path, "rb") as f:
-                        while chunk := f.read(1024):
-                            conn.sendall(chunk)
-                    print(f"[UPLOAD] Sent file {file_id} to {addr} (user: {requesting_user})")
-
-                else:
+                if file_id not in self.shared_files:
                     conn.send(b"ERROR: File not found.")
+                    return
 
+                file_path = self.shared_files[file_id]["path"]
+
+                # 🔐 Metadata (key, iv, hash, original filename)
+                enc_meta = self.encryption_keys.get(file_id)
+                if not enc_meta:
+                    conn.send(b"ERROR: Encryption metadata not found.")
+                    return
+
+                metadata = {
+                    "key": enc_meta["key"].hex(),
+                    "iv": enc_meta["iv"].hex(),
+                    "hash": enc_meta["hash"],
+                    "filename": enc_meta["original_name"]
+                }
+
+                # 🔹 Send metadata as JSON, ending with newline
+                conn.sendall((json.dumps(metadata) + "\n").encode())
+                time.sleep(0.1)  # 🧠 Ensure clean separation before sending file
+
+                # 🔹 Send encrypted file content
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(4096):
+                        conn.sendall(chunk)
+
+                print(f"[UPLOAD] Sent file {file_id} to {addr} (user: {requesting_user})")
 
             elif data == "LIST_FILES":
                 file_list = []
@@ -272,14 +327,15 @@ class FileSharePeer:
                         "size": meta["size"]
                     })
 
-                # Include username of this peer (if logged in)
                 response = {
                     "files": file_list,
                     "username": self.logged_in_user or "unknown"
                 }
                 conn.sendall(json.dumps(response).encode())
+
             else:
-                print(f"[{addr}] {data}")  # Basic text message fallback
+                print(f"[{addr}] {data}")  # Fallback for other message types
+
         except Exception as e:
             print(f"[!] Error with {addr}: {e}")
         finally:
