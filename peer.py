@@ -37,7 +37,11 @@ class FileSharePeer:
 
     def start_server(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.bind((self.local_ip, self.listen_port))
+        try:
+            server.bind((self.local_ip, self.listen_port))
+        except OSError:
+            print("[!] Port already in use. Please restart with a different port.")
+            return
         server.listen(5)
         print(f"[TCP] Listening on {self.local_ip}:{self.listen_port}...")
         while self.running:
